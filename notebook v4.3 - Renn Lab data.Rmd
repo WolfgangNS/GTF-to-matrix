@@ -1,0 +1,871 @@
+---
+title: "WGCNA v3.5"
+---
+#from Wolfgang, adapted from several sources for sub/dom A. burtoni
+
+```{r Sources}
+#FIRST: DIFFERENTIAL EXPRESSION ANALYSIS FROM MOHAMMED KHALFAN
+#https://learn.gencore.bio.nyu.edu/rna-seq-analysis/gene-set-enrichment-analysis/
+
+#WGCNA by Khushbu Patel
+#https://github.com/kpatel427/YouTubeTutorials/blob/main/WGCNA.R
+#https://www.youtube.com/watch?v=mzXIxjPr_Mc
+#https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE152418
+
+#Enrichment by Yulab (Guangchuang Yu)
+#https://yulab-smu.top/biomedical-knowledge-mining-book/enrichplot.html
+
+#Network export by Siva Chudalayandi and Jennifer Chang
+#https://bioinformaticsworkbook.org/dataAnalysis/RNA-Seq/RNA-SeqIntro/wgcna.html#gsc.tab=0
+```
+
+
+# Install and load required packages ---------------
+```{r Install, message=FALSE, warning=FALSE}
+#For treatment/control differential pathview
+#options(repos = c(CRAN = "https://cran.rstudio.com/"), dependencies = "Depends")
+
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("clusterProfiler", ask=FALSE) #version = "3.8"
+BiocManager::install("pathview", ask=FALSE)
+BiocManager::install("enrichplot", ask=FALSE)
+BiocManager::install("DESeq2", ask=FALSE)
+
+install.packages("knitr", ask=FALSE)
+
+
+
+#WGCNA
+#5min benchmark
+install.packages(c('markdown','dplyr','gridExtra', 'tidyverse', 'magrittr', 'WGCNA', "corrplot", "IRDisplay"))
+BiocManager::install(c("DESeq2", 'GEOquery', 'GO.db', 'impute', 'preprocessCore'))
+
+install.packages('devtools')
+devtools::install_github("kevinblighe/CorLevelPlot")
+install.packages('corrplot')
+
+#update a/s/n? Respond "n".
+#Restart R? Click no.
+#Choose "no" to packages requiring compilation.
+#Manually restart after installing packages.
+
+
+
+
+
+#For enrichment of modules:
+BiocManager::install("AnnotationHub", ask = FALSE)
+BiocManager::install("DOSE", ask=FALSE)
+BiocManager::install("enrichplot", ask=FALSE)
+BiocManager::install("clusterProfiler", ask=FALSE)
+
+#network viz export
+install.packages('svglite')
+```
+
+```{r Load}
+#pathview
+library(clusterProfiler)
+library(enrichplot)
+library(ggplot2)
+library(knitr)
+library(dplyr)
+
+#WGCNA
+library(WGCNA)
+library(DESeq2)
+library(GEOquery)
+library(tidyverse)
+library(CorLevelPlot)
+library(gridExtra)
+library(magrittr)
+library(corrplot)
+
+allowWGCNAThreads()
+
+#enrichment bar plot
+library(AnnotationHub)
+library(DOSE)
+library(enrichplot)
+library(clusterProfiler)
+
+library(svglite)
+```
+
+
+# Pathway enrichment and visualization (sub vs. dom) ---------------
+## Retrieve OrgDB package for O. Niloticus from AnnotationHub
+```{r Download}
+BiocManager::install("AnnotationHub", ask = FALSE)
+library(AnnotationHub)
+ah = AnnotationHub()
+#respond no to restart R, yes to create AnnotationHub directory in Local folder
+
+OnDb <- ah[["AH114368"]] #Oreochromis niloticus annotations
+```
+
+## Find log2fold change from NT to T
+```{r Load dataframe and attributes}
+#Wolfgang
+
+df <- read.delim('matrix.tsv', header = T, row.names = 1)
+
+attributes_df <- read.delim('attributes.tsv', header = T)
+
+# sample_names <- names(df)
+# sample_names <- gsub("_.*", "", sample_names) 
+# 
+# sample_mapping <- setNames(attributes_df$GSM_id, attributes_df$samplename)
+# 
+# # Rename dataframe headers with GSM IDs
+# colnames(df) <- sample_mapping[sample_names]
+
+df <- df[, order(colnames(df))]
+attributes_df <- attributes_df[order(attributes_df$GSM_id), ]
+colnames(df) <- attributes_df$samplename
+
+#this doesn't do a proper left join, so it's not generalized enough to work for new data
+```
+
+
+
+```{r}
+#code adapted from dataset for territorial and nonterritorial, 
+#but this time it's for brooding/nonbrooding
+
+df <- df %>%
+  mutate(
+    mean_territorial = rowMeans(dplyr::select(., matches("R.*$"))), 
+    mean_nonterritorial = rowMeans(dplyr::select(., matches("B.*$"))) 
+  ) %>%
+  mutate(log2foldchange = log2(mean_territorial / mean_nonterritorial)) %>%
+  mutate(EnsemblId = rownames(df)) %>%
+  filter(grepl("ENSONIG.*", EnsemblId)) %>%
+  dplyr::select(EnsemblId, log2foldchange, mean_territorial, mean_nonterritorial)
+
+
+original_gene_list <- df$log2foldchange
+names(original_gene_list) <- df$EnsemblId
+gene_list<-na.omit(original_gene_list)
+gene_list = sort(gene_list, decreasing = TRUE)
+```
+
+
+## ENSEMBL to ENTREZID
+```{r Convert}
+valid_keys <- keys(OnDb, keytype = "ENSEMBL")
+
+#Convert id's from ENSEMBL to ENTREZID, for KEGG input
+ids <- bitr(names(original_gene_list), fromType = "ENSEMBL", toType = "ENTREZID", OrgDb=`OnDb`)
+
+#entrez_ids <- bitr(brown_genes, fromType="ENSEMBL", toType="ENTREZID", OrgDb=ah[["AH114368"]])
+
+dedup_ids = ids[!duplicated(ids[c("ENSEMBL")]),]
+
+df2 = df[df$EnsemblId %in% dedup_ids$ENSEMBL,]
+
+df2$ENTREZID = dedup_ids$ENTREZID
+
+kegg_gene_list <- df2$log2foldchange
+
+names(kegg_gene_list) <- df2$ENTREZID
+
+kegg_gene_list<-na.omit(kegg_gene_list)
+
+kegg_gene_list = sort(kegg_gene_list, decreasing = TRUE)
+
+```
+
+## Optional - browse available species annotations
+```{r Browse}
+library(pathview)
+data(korg)
+korg %>% 
+  as.data.frame() %>%
+  View()
+#use ctrl+F to find Nile tilapia
+#https://www.bioconductor.org/packages/release/bioc/vignettes/pathview/inst/doc/pathview.pdf
+```
+
+## Pathview
+```{r Pathview, message=F, warning=F, echo = TRUE}
+kegg_organism = "onl" #Oreochromis niloticus
+
+#Link to pathways: https://www.genome.jp/brite/query=00190&htext=br08901.keg&option=-a&node_proc=br08901_org&proc_enabled=onl&panel=collapse
+
+dme <- pathview(gene.data=kegg_gene_list, pathway.id="onl00620", species = kegg_organism)
+#ref: https://www.genome.jp/pathway/onl00620
+
+# Produce a different plot (PDF) (not displayed here)
+dme <- pathview(gene.data=kegg_gene_list, pathway.id="onl00620", species = kegg_organism, kegg.native = F)
+```
+
+## Display
+```{r Display, echo=TRUE, fig.cap="KEGG Native Enriched Pathway Plot", out.width = '100%'}
+knitr::include_graphics("onl00620.pathview.png")
+```
+
+
+
+
+# WGCNA ---------------
+```{r Load dataframes}
+# #from Wolfgang
+# 
+# library(readxl)
+# 
+# file_path <- "d-rom data.xlsx"
+# dROM <- readxl::read_excel(file_path)
+# col_names <- readxl::read_excel(file_path, range = "A1:Z1")
+# 
+# file_path <- "Plasma ORAC data.xlsx"
+# plasmaORAC <- readxl::read_excel(file_path)
+# col_names <- readxl::read_excel(file_path, range = "A1:Z1")
+# 
+# file_path <- "DNA damage data.xlsx"
+# dnaDamage <- readxl::read_excel("DNA damage data.xlsx")
+# col_names <- readxl::read_excel(file_path, range = "A1:Z1")
+# 
+# file_path <- "Dissection data-up-to-date.xlsx"
+# dissection <- readxl::read_excel(file_path)
+# col_names <- readxl::read_excel(file_path, range = "A1:Z1")
+# 
+# # merge tables
+# fishData <- merge(dissection, dnaDamage, by.x = "Fish.code", by.y = "Fish code", all = TRUE)
+# fishData <- merge(fishData, dROM, by = "Fish.code", all = TRUE)
+# fishData <- merge(fishData, plasmaORAC, by = "Fish.code", all = TRUE)
+# fishData <- fishData[order(factor(fishData$Status, levels = c("T", "NT")), fishData$Fish.code), ]
+# 
+# head(fishData)
+```
+
+```{r}
+# 1. Load data ------------------------------------------------
+
+
+###NOTE BEFORE PROCEDDING: I NEED TO FIX matrix.tsv THROUGH COLAB.
+###SOME COUNTS ARE REPORTED AS OVER 1E+18, SOME IN THE NEGATIVE
+
+data <- read.delim('matrix.tsv', header = T, row.names = 1)
+colnames(data) <- sub("_.*", "", colnames(data))
+
+phenoData <- read.delim('attributes.tsv', header = T, row.names = 2)
+#TO-DO: coordinate this with the Colab notebook
+phenoData <- separate(phenoData, samplename, into = c("reproductive.time.point", "stock", "num"), sep = "_")
+#not certain what "num" is
+```
+
+
+## Subset data by ONLY R's this time
+```{r}
+# data <- 
+#   data %>% 
+#   .[,14:25] #subset only the R females this time
+# 
+# phenoData <-
+#   phenoData %>%
+#   .[14:25,]
+# 
+# head(data, 4)
+```
+
+```{r}
+# 2. QC - outlier detection ------------------------------------------------
+# detect outlier genes
+
+gsg <- goodSamplesGenes(t(data))
+summary(gsg)
+gsg$allOK
+
+table(gsg$goodGenes)
+table(gsg$goodSamples)
+
+# remove genes that are detectd as outliers
+data <- data[gsg$goodGenes == TRUE,]
+
+# detect outlier samples - hierarchical clustering - method 1
+htree <- hclust(dist(t(data)), method = "average")
+plot(htree)
+
+
+# pca - method 2
+
+pca <- prcomp(t(data))
+pca.dat <- pca$x
+
+pca.var <- pca$sdev^2
+pca.var.percent <- round(pca.var/sum(pca.var)*100, digits = 2)
+
+pca.dat <- as.data.frame(pca.dat)
+
+ggplot(pca.dat, aes(PC1, PC2)) +
+  geom_point() +
+  geom_text(label = rownames(pca.dat)) +
+  labs(x = paste0('PC1: ', pca.var.percent[1], ' %'),
+       y = paste0('PC2: ', pca.var.percent[2], ' %'))
+
+
+### NOTE: If there are batch effects observed, correct for them before moving ahead
+
+
+# exclude outlier samples
+samples.to.be.excluded <- c('none')
+data.subset <- data[,!(colnames(data) %in% samples.to.be.excluded)]
+
+```
+
+```{r}
+# 3. Normalization ----------------------------------------------------------------------
+# create a deseq2 dataset
+
+colData <- phenoData
+
+#reorder alphabetically
+data.subset <- round(data.subset)
+data.subset <- data.subset[, order(colnames(data.subset))]
+colData <- colData[order(rownames(colData)),]
+
+# create dds
+dds <- DESeqDataSetFromMatrix(countData = data.subset,
+                              colData = colData,
+                              design = ~ 1) # not spcifying model
+
+
+
+## remove all genes with counts < 15 in more than 75% of samples (31*0.75=23.25)
+## suggested by WGCNA on RNAseq FAQ
+
+dds75 <- dds[rowSums(counts(dds) >= 15) >= 9,] #changed this
+nrow(dds75) # 13284 genes
+
+
+# perform variance stabilization
+dds_norm <- vst(dds75) #nsub=nrow(dds)
+
+
+# get normalized counts
+norm.counts <- assay(dds_norm) %>% 
+  t()
+
+```
+
+```{r}
+# 4. Network Construction  ---------------------------------------------------
+#wolfgang - 9m10s benchmark
+
+# Choose a set of soft-thresholding powers
+power <- c(c(1:10), seq(from = 12, to = 50, by = 2))
+
+# Call the network topology analysis function
+sft <- pickSoftThreshold(norm.counts,
+                  powerVector = power,
+                  networkType = "unsigned", #previously "signed"
+                  verbose = 5)
+
+
+sft.data <- sft$fitIndices
+
+# visualization to pick power
+
+a1 <- ggplot(sft.data, aes(Power, SFT.R.sq, label = Power)) +
+  geom_point() +
+  geom_text(nudge_y = 0.1) +
+  geom_hline(yintercept = 0.8, color = 'red') +
+  labs(x = 'Power', y = 'Scale free topology model fit, signed R^2') +
+  theme_classic()
+
+
+a2 <- ggplot(sft.data, aes(Power, mean.k., label = Power)) +
+  geom_point() +
+  geom_text(nudge_y = 0.1) +
+  labs(x = 'Power', y = 'Mean Connectivity') +
+  theme_classic()
+  
+
+grid.arrange(a1, a2, nrow = 2)
+```
+
+```{r}
+# convert matrix to numeric
+norm.counts[] <- sapply(norm.counts, as.numeric)
+
+soft_power <- 3 #modified 04-25
+
+temp_cor <- cor
+cor <- WGCNA::cor
+
+
+# memory estimate w.r.t blocksize
+bwnet <- blockwiseModules(norm.counts,
+                 maxBlockSize = 14000,
+                 TOMType = "signed",
+                 power = soft_power,
+                 mergeCutHeight = 0.25,
+                 numericLabels = FALSE,
+                 randomSeed = 1234,
+                 verbose = 3)
+
+
+cor <- temp_cor
+
+```
+
+```{r}
+# 5. Module Eigengenes ---------------------------------------------------------
+module_eigengenes <- bwnet$MEs
+
+
+# Print out a preview
+head(module_eigengenes)
+
+
+# get number of genes for each module
+table(bwnet$colors)
+
+# Plot the dendrogram and the module colors before and after merging underneath
+plotDendroAndColors(bwnet$dendrograms[[1]], cbind(bwnet$unmergedColors, bwnet$colors),
+                    c("unmerged", "merged"),
+                    dendroLabels = FALSE,
+                    addGuide = TRUE,
+                    hang= 0.03,
+                    guideHang = 0.05)
+
+# grey module = all genes that doesn't fall into other modules were assigned to the grey module
+
+```
+
+
+
+
+```{r Wolfgang - Module trait heatmap}
+# Create traits file
+traits <- colData %>%
+  mutate(
+    R_status = ifelse(startsWith(reproductive.time.point,"R"), 1, 0),
+    B_status = ifelse(startsWith(reproductive.time.point,"B"), 1, 0),
+    stock_WS = ifelse(stock=="WS", 1, 0),
+    stock_LS = ifelse(stock=="LS", 1, 0),
+    num = as.numeric(num), #I still have no idea what this is
+    time_point = as.numeric(sub("[RB]", "", reproductive.time.point))
+  ) %>%
+  dplyr::select(
+    R_status,
+    B_status,
+    stock_WS,
+    stock_LS,
+    num,
+    time_point
+  )%>%
+  mutate_if(is.numeric, as.numeric)
+  #mutate_at(vars(Sequence_number:TAC), as.numeric)  # Treat the last 7 columns as numeric
+
+
+# Define numbers of genes and samples
+nSamples <- nrow(norm.counts)
+nGenes <- ncol(norm.counts)
+
+# Assuming module_eigengenes is your matrix of eigengenes
+module.trait.corr <- cor(module_eigengenes, traits, use = 'p')
+module.trait.corr.pvals <- corPvalueStudent(module.trait.corr, nSamples)
+
+# Visualize module-trait association as a heatmap
+heatmap.data <- merge(module_eigengenes, traits, by = 'row.names')
+heatmap.data <- heatmap.data %>% 
+  column_to_rownames(var = 'Row.names')
+
+#wolfgang was here, 03-27
+heatmap.data2 <- as.data.frame(heatmap.data)
+
+correlation_matrix <- cor(heatmap.data, use = "pairwise.complete.obs") #this ignores the NA values
+
+testRes <- cor.mtest(heatmap.data, conf.level = 0.95)
+
+my_palette <- colorRampPalette(c("red", "#FFFFFF", "blue"))(n = 100)
+
+file_path= "Correlation matrix 05-03.png"
+png(height=800, width=800, file=file_path, type = "cairo")
+
+{
+    cex.before <- par("cex")
+    par(cex = 0.9) #0.3
+    corrplot(correlation_matrix, method = "color", 
+             order = 'hclust', addrect = 2,
+             tl.col = "black", tl.srt = 45,
+             title = "Module-trait Pearson correlations", cex.main = 2,
+             mar=c(0,0,7,0), #fixes the margin
+             col = my_palette,
+             p.mat = testRes$p, #insig = 'p-value',
+             tl.cex = 0.9/par("cex"), cl.cex = 0.8/par("cex"),
+             number.cex = 5,
+             insig = 'label_sig', sig.level = c(0.001, 0.01, 0.05), pch.cex=1)
+    par(cex = cex.before)
+}
+
+dev.off()
+
+knitr::include_graphics(file_path)
+```
+
+```{r}
+# 6A. Relate modules to traits --------------------------------------------------
+# module trait associations
+
+# Define numbers of genes and samples
+nSamples <- nrow(norm.counts)
+nGenes <- ncol(norm.counts)
+
+module.trait.corr <- cor(module_eigengenes, traits, use = 'p')
+module.trait.corr.pvals <- corPvalueStudent(module.trait.corr, nSamples)
+
+# visualize module-trait association as a heatmap
+
+heatmap.data <- merge(module_eigengenes, traits, by = 'row.names')
+
+head(heatmap.data)
+
+heatmap.data <- heatmap.data %>% 
+  column_to_rownames(var = 'Row.names')
+
+svg_path <- "correlation_plot-05-03.svg"
+svg(svg_path, width = 8, height = 8)
+#png(height=800, width=800, file=file_path, type = "cairo")
+
+cex.before <- par("cex")
+par(cex = 2.0) #0.3
+c1 <- ncol(module_eigengenes)
+c2 <- ncol(traits)
+CorLevelPlot(heatmap.data,
+         x = names(heatmap.data)[(c1+1):(c1+c2)], 
+         y = names(heatmap.data)[1:c1], 
+         col = c("blue", "white", "red"),
+         cexLabX = 1.0,
+         cexLabY = 1.0,
+         rotLabX = 45)
+par(cex = cex.before)
+
+dev.off()
+
+knitr::include_graphics(svg_path)
+```
+
+
+
+## Optional - view list of all ENSEMBL id's from a module
+```{r}
+#retrieve a list of genes from the module 
+#very useful for inputting into DAVID analysis,
+#https://david.ncifcrf.gov/tools.jsp
+module.gene.mapping <- as.data.frame(bwnet$colors)
+brown_genes <-
+  module.gene.mapping %>% 
+  filter(`bwnet$colors` == 'brown') %>% 
+  rownames() 
+
+brown_genes %>% cat()
+```
+
+```{r}
+##https://bioconductor.org/packages/devel/bioc/vignettes/AnnotationHub/inst/doc/AnnotationHub-HOWTO.html
+
+ah = AnnotationHub()
+####respond no to restart R, yes to create AnnotationHub directory in Local folder
+
+OnDb <- ah[["AH114368"]] #Oreochromis niloticus annotations
+```
+
+
+# Enrichment (biological processes) ---------------
+### TERM2GENE troubleshooting
+### https://support.bioconductor.org/p/9144621/
+```{r}
+#http://yulab-smu.top/biomedical-knowledge-mining-book/clusterprofiler-kegg.html#clusterprofiler-kegg-pathway-ora
+
+entrez_ids <- as.character(ids$ENTREZID)
+
+ergg <- groupGO( #enrichment result groupGO
+    entrez_ids,
+    OnDb,
+    keyType = "ENTREZID",
+    ont = "BP",
+    level = 3,
+    readable = FALSE
+)
+
+ergg <-
+  ergg %>% 
+  arrange(desc(Count)) 
+  #.[20:nrow(.),] #optional, skip first 20 rows because they're obvious
+
+ergg %>% as.data.frame()
+#Amazing!! -Wolfgang, 05/03 9:30pm
+```
+
+## enrichment barplot
+```{r}
+barplot(ergg, showCategory=10)
+```
+
+
+# Module membership  ---------------
+```{r Calculate membership}
+#wolfgang
+#Membership p-value: likelihood that a given gene belongs to a module
+#Membership measure: increase or decrease in expression level, relative to average
+#High membership p-value genes might be called "driver genes"
+
+
+#KPatel code:
+# 6B. Intramodular analysis: Identifying driver genes ---------------
+
+# Calculate the module membership and the associated p-values
+
+# The module membership/intramodular connectivity is calculated as the correlation of the eigengene and the gene expression profile. 
+# This quantifies the similarity of all genes on the array to every module.
+
+module.membership.measure <- cor(module_eigengenes, norm.counts, use = 'p')
+module.membership.measure.pvals <- corPvalueStudent(module.membership.measure, nSamples)
+
+module.membership.measure.pvals[1:10,1:10]
+
+gene.signf.corr <- cor(norm.counts, traits$`serum_dROM`, use = 'p')
+gene.signf.corr.pvals <- corPvalueStudent(gene.signf.corr, nSamples)
+
+
+gene.signf.corr.pvals %>% 
+  as.data.frame() %>% 
+  #arrange(V1) %>% 
+  head(25)
+
+```
+
+```{r brown module membership bar chart}
+modulename <- "MEbrown"
+
+## Gene module membership bar chart
+top_genes_brown <-
+  module.membership.measure.pvals %>% 
+  .[modulename,] %>% 
+  as.data.frame() %>% 
+  arrange(.data[["."]]) %>%
+  head(400)
+
+top_genes_brown
+
+eigengene_expression_brown <- 
+  module.membership.measure %>%
+  .[modulename,] %>% 
+  as.data.frame() %>%
+  .[rownames(top_genes_brown), , drop = FALSE]
+
+eigengene_expression_brown
+
+barplot(eigengene_expression_brown[, 1],  # Assuming the membership measure is in the first column
+        names.arg = rownames(eigengene_expression_brown),
+        main = "Top 500 Genes by p-value and Membership Measure",
+        xlab = "Genes",
+        ylab = "Membership Measure",
+        #col = "#AFC8AD",
+        #border = "#88AB8E",
+        col = "#DCF2F1",
+        border = "#7FC7D9",
+        las = 2,  # Rotate x-axis labels vertically
+        ylim = c(
+                min(eigengene_expression_brown[, 1]) * 1.2, 
+                max(eigengene_expression_brown[, 1]) * 1.2))
+
+## module membership heatmap
+library(readr)
+library(ggplot2)
+library(magrittr)
+
+
+#improved code that uses normalized counts from earlier
+percentage_deviations <- 
+  norm.counts %>%
+  t() %>%
+  as.data.frame() %>%
+  apply(1, function(row) {((row - mean(row)) / mean(row)) * 100}) %>%
+  t() %>%
+  as.data.frame() %>%
+  filter(row.names(.) %in% row.names(top_genes_brown)) %>%
+  dplyr::arrange(match(row.names(.), row.names(top_genes_brown))) %>%
+  .[1:400,]
+  
+  
+custom_palette <- colorRampPalette(c("green", "black", "red"))(256)
+#red = positive, green = negative
+
+heatmap(as.matrix(percentage_deviations), Rowv = NA, Colv = NA, col = custom_palette)
+
+
+## module membership bar chart
+module_eigengenes %>% head()
+
+module_eigengenes %>% 
+      t() %>%
+      as.data.frame() %>%
+      filter(row.names(.) %in% c(modulename))
+      
+df_long <- gather(module_eigengenes %>% 
+      t() %>%
+      as.data.frame() %>%
+      filter(row.names(.) %in% c(modulename))) %>%
+      arrange(match(row.names(.), row.names(module_eigengenes)))
+
+ggplot(df_long, aes(x = fct_inorder(key), y = value, fill = factor(sign(value)))) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("green", "red")) +
+  labs(x = "Sample", y = "Expression value", title = paste(modulename, "eigengene expression by sample")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+# Network visualization ---------------
+```{r Siva Chudalayandi - export genes with color labels}
+#Source: https://bioinformaticsworkbook.org/tutorials/wgcna.html#gsc.tab=0
+
+module_df = data.frame(names(bwnet[["colors"]]), bwnet[["colors"]])
+names(module_df) = c('gene_id', 'colors')
+
+#Optional: export list of individual genes with labels for color module membership
+#useful for exporting to gene enrichment, such as DAVID
+# write_delim(module_df, file = "gene_modules 05-05.txt", delim = "\t")
+```
+
+
+```{r Optional - Preview the modules with the most unique genes}
+color_counts <- table(module_df$colors)
+color_counts_df <- as.data.frame(color_counts)
+colnames(color_counts_df) <- c("Color", "Count")
+color_counts_df <- color_counts_df[order(-color_counts_df$Count), ]
+print(color_counts_df)
+
+```
+
+
+```{r Select modules of interest, preprocess}
+#Wolfgang - I've chosen these because they have significant correlations with specific phenotypes
+modules_of_interest = c("brown", "blue", "yellow", "pink")
+
+submod = module_df %>%
+  subset(colors %in% modules_of_interest)
+
+row.names(module_df) = module_df$gene_id
+
+
+
+genes_of_interest <- module_df %>%
+  subset(colors %in% modules_of_interest)
+
+#Jennifer Chang had several additional steps for quantile normalization after VST
+
+vsd <- varianceStabilizingTransformation(dds)
+
+#BiocManager::install("genefilter")
+#library(genefilter)
+
+dds <- estimateSizeFactors(dds)
+dds <- estimateDispersions(dds)
+
+wpn_vsd <- getVarianceStabilizedData(dds)
+rv_wpn <- rowVars(wpn_vsd)
+summary(rv_wpn)
+
+q75_wpn <- quantile( rowVars(wpn_vsd), .75)  # <= original
+q95_wpn <- quantile( rowVars(wpn_vsd), .95)  # <= changed to 95 quantile to reduce dataset
+expr_normalized <- wpn_vsd[ rv_wpn > q95_wpn, ]
+
+expr_normalized[1:5,1:10]
+
+expr_of_interest <- norm.counts[, colnames(norm.counts) %in% genes_of_interest$gene_id]
+
+expr_of_interest[1:5,1:5]
+
+```
+
+
+```{r TOM for selected gene modules - from Chang}
+
+TOM = TOMsimilarityFromExpr(expr_of_interest,
+                            power = soft_power)
+
+row.names(TOM) = colnames(expr_of_interest)
+colnames(TOM) = colnames(expr_of_interest)
+
+edge_list = data.frame(TOM) %>%
+  mutate(
+    gene1 = row.names(.)
+  ) %>%
+  pivot_longer(-gene1) %>%
+  dplyr::rename(gene2 = name, correlation = value) %>%
+  unique() %>%
+  subset(!(gene1==gene2)) %>%
+  mutate(
+    module1 = module_df[gene1,]$colors,
+    module2 = module_df[gene2,]$colors
+  )
+
+# Export Network file to be read into Cytoscape, VisANT, etc
+write_delim(edge_list,
+            file = "edgelist_comprehensive 04-02.tsv",
+            delim = "\t")
+```
+```{r}
+edge_list %>%
+  mutate(intramodular = ifelse(module1 == module2, "aye", "nay")) %>%
+  arrange(module1, intramodular, module2) %>%
+  head(1000) %>%
+  View()
+  #as_tbl_graph()
+```
+
+
+```{r}
+#https://ggraph.data-imaginist.com/articles/Layouts.html
+library(ggraph)
+library(tidygraph)
+library(svglite)
+
+set_graph_style(plot_margin = margin(1,1,1,1))
+graph <- 
+  edge_list %>%
+  arrange(-correlation) %>%
+  head(5000) %>% #top 1000 correlations (edges)
+  mutate(intramodular = ifelse(module1 == module2, "aye", "nay")) %>%
+  arrange(module1, intramodular, module2) %>% 
+  ## TO-DO: sort by degree, descending -----------------------
+  as_tbl_graph()
+
+# Not specifying the layout - defaults to "auto"
+networkviz <- 
+  ggraph(graph) + 
+  geom_edge_link(aes(colour = factor(module1))) + 
+  geom_node_point()
+
+svg_file <- "networkviz.svg"
+ggsave(svg_file, plot = networkviz, device = "svg")
+
+include_graphics(svg_file)
+```
+
+```{r, warning=F}
+#https://github.com/thomasp85/ggraph/issues/256#issuecomment-1889356961
+
+#1-2min
+networkviz2 <-
+  ggraph(graph, 'linear', circular = TRUE) +
+  geom_edge_arc(aes(colour = module1, alpha = 1), edge_width=0.1) + 
+  geom_node_point(size=0.01) +  # Add dots for nodes
+  coord_fixed(xlim = c(-1.2, 1.2), ylim = c(-1.2, 1.2))
+
+svg_file <- "networkviz9.svg"
+ggsave(svg_file, plot = networkviz2, device = "svg")
+
+include_graphics(svg_file)
+```
+
+
+
